@@ -3,12 +3,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from proactive.config import Settings
-from proactive.core import Core
-from proactive.llm import FollowUp, NewFact, NewTask, TaskUpdate, Turn
-from proactive.roles import build_role
-from proactive.schedule import in_quiet_hours, next_occurrence, push_out_of_quiet
-from proactive.storage import Storage
+from agentagent.config import Settings
+from agentagent.core import Core
+from agentagent.llm import FollowUp, NewFact, NewTask, TaskUpdate, Turn
+from agentagent.roles import build_role
+from agentagent.schedule import in_quiet_hours, next_occurrence, push_out_of_quiet
+from agentagent.storage import Storage
 
 MSK = ZoneInfo("Europe/Moscow")
 

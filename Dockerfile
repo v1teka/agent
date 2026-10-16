@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY pyproject.toml ./
-COPY proactive ./proactive
+COPY agentagent ./agentagent
 RUN pip install --no-cache-dir .
-CMD ["python", "-m", "proactive"]
+CMD ["python", "-m", "agentagent"]

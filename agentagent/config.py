@@ -1,4 +1,4 @@
-"""Settings loaded from environment variables (see .env.example)."""
+"""agentagent settings loaded from environment variables (see .env.example)."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ class Settings:
     allowed_user_ids: set[int] = field(default_factory=set)
     model: str = "claude-opus-5-5"
     effort: str = "low"
-    db_path: Path = Path("data/proactive.db")
+    db_path: Path = Path("data/agentagent.db")
     timezone: ZoneInfo = ZoneInfo("Europe/Moscow")
     role: str = "mentor"
     morning_at: time = time(9, 0)
