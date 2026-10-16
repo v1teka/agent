@@ -1,0 +1,19 @@
+[project]
+name = "proactive-bot"
+version = "0.1.0"
+description = "A Telegram bot that writes first: memory about you, a schedule of check-ins, and roles on top."
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=1.15",
+    "python-telegram-bot[job-queue]>=21.0",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[tool.setuptools]
+packages = ["proactive", "proactive.roles"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
