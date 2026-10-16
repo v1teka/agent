@@ -3,12 +3,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from agentagent.config import Settings
-from agentagent.core import Core
-from agentagent.llm import FollowUp, NewFact, NewTask, TaskUpdate, Turn
-from agentagent.roles import build_role
-from agentagent.schedule import in_quiet_hours, next_occurrence, push_out_of_quiet
-from agentagent.storage import Storage
+from agent.config import Settings
+from agent.core import Core
+from agent.llm import FollowUp, NewFact, NewTask, TaskUpdate, Turn
+from agent.roles import build_role
+from agent.schedule import in_quiet_hours, next_occurrence, push_out_of_quiet
+from agent.storage import Storage
 
 MSK = ZoneInfo("Europe/Moscow")
 
