@@ -7,6 +7,7 @@ dependencies = [
     "anthropic>=1.15",
     "python-telegram-bot[job-queue]>=21.0",
     "pydantic>=2.7",
+    "tzdata",  # slim Docker images have no system time zone database
 ]
 
 [project.optional-dependencies]

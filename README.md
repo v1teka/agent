@@ -31,28 +31,41 @@ bot.py                                    ← Telegram
 - `/tasks` — последние задания
 - `/pause`, `/resume` — выключить и включить сообщения первым
 
-## Запуск
+## Запуск на VPS (рекомендуется)
+
+Боту нужен сервер, который работает круглосуточно, иначе он не сможет писать первым.
 
 1. Создай бота у [@BotFather](https://t.me/BotFather) (`/newbot`) и скопируй токен.
 2. Получи API‑ключ на [platform.claude.com](https://platform.claude.com/settings/keys).
-3. Скопируй `.env.example` в `.env` и впиши `TELEGRAM_BOT_TOKEN` и `ANTHROPIC_API_KEY`. Файл `.env` в git не попадает.
-4. Запусти одним из способов:
+3. Арендуй самый простой VPS с Ubuntu 24.04: 1 ядро и 1 ГБ памяти хватит. Сервер должен быть
+   в стране, где работает API Claude (например, Германия или Финляндия).
+4. Зайди на сервер по SSH (`ssh root@IP-сервера`) и выполни:
 
    ```bash
-   # Docker
-   docker compose up -d --build
-
-   # или Python 3.11+
-   python -m venv .venv && source .venv/bin/activate
-   pip install -e .
-   python -m agent
+   curl -fsSL https://raw.githubusercontent.com/v1teka/agent/main/deploy/install.sh | sudo bash
    ```
 
-5. Напиши боту в Telegram. Чтобы им не мог пользоваться никто другой, впиши свой Telegram id в
-   `ALLOWED_USER_IDS` (бот сам подскажет id, если написать ему, пока там стоит чужой) и перезапусти.
+   Скрипт поставит Docker, скачает бота в `/opt/agent`, спросит токен и ключ (они сохраняются только
+   на сервере, в `/opt/agent/.env`), проверит, что Telegram и Claude отвечают с этого сервера,
+   и запустит бота. Он перезапускается сам после сбоев и перезагрузки сервера.
+5. Напиши боту `/start`. Чтобы им не мог пользоваться никто другой, впиши свой Telegram id в
+   `ALLOWED_USER_IDS` в `/opt/agent/.env` (бот сам подскажет id, если написать ему, пока там стоит чужой)
+   и перезапусти: `cd /opt/agent && docker compose restart`.
 
-Боту нужен постоянно работающий процесс, иначе он не сможет написать первым: подойдёт любой VPS,
-домашний сервер или компьютер, который не засыпает. Данные лежат в `data/agent.db`.
+Обновить бота до свежей версии: выполнить ту же команду установки ещё раз, настройки и память сохранятся.
+Логи: `cd /opt/agent && docker compose logs -f`.
+
+## Запуск у себя
+
+Скопируй `.env.example` в `.env`, впиши `TELEGRAM_BOT_TOKEN` и `ANTHROPIC_API_KEY` и запусти:
+
+```bash
+docker compose up -d --build
+# или без Docker, Python 3.11+
+python -m venv .venv && source .venv/bin/activate && pip install -e . && python -m agent
+```
+
+Данные лежат в `data/agent.db`.
 
 ## Модель
 
