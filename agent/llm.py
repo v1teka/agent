@@ -4,6 +4,7 @@ so a local model or another provider can be plugged in later."""
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import anthropic
@@ -52,8 +53,27 @@ class Turn(BaseModel):
     )
 
 
+@dataclass(frozen=True)
+class Usage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
+
+
+class ThinkError(RuntimeError):
+    """The model answered but gave no usable output; tokens were still spent."""
+
+    def __init__(self, message: str, usage: Usage):
+        super().__init__(message)
+        self.usage = usage
+
+
+SILENT = Turn(message="", new_facts=[], new_task=None, task_updates=[], follow_ups=[])
+
+
 class LLM(Protocol):
-    async def think(self, system: str, messages: list[dict]) -> Turn: ...
+    async def think(self, system: str, messages: list[dict]) -> tuple[Turn, Usage]: ...
 
 
 class ClaudeLLM:
@@ -62,7 +82,7 @@ class ClaudeLLM:
         self.model = model
         self.effort = effort
 
-    async def think(self, system: str, messages: list[dict]) -> Turn:
+    async def think(self, system: str, messages: list[dict]) -> tuple[Turn, Usage]:
         response = await self.client.beta.messages.parse(
             model=self.model,
             max_tokens=16000,
@@ -74,9 +94,16 @@ class ClaudeLLM:
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
         )
+        u = response.usage
+        usage = Usage(
+            input_tokens=u.input_tokens or 0,
+            output_tokens=u.output_tokens or 0,
+            cache_read=u.cache_read_input_tokens or 0,
+            cache_write=u.cache_creation_input_tokens or 0,
+        )
         if response.stop_reason == "refusal":
             log.warning("Model refused: %s", response.stop_details)
-            return Turn(message="", new_facts=[], new_task=None, task_updates=[], follow_ups=[])
+            return SILENT, usage
         if response.parsed_output is None:
-            raise RuntimeError(f"No structured output (stop_reason={response.stop_reason})")
-        return response.parsed_output
+            raise ThinkError(f"No structured output (stop_reason={response.stop_reason})", usage)
+        return response.parsed_output, usage

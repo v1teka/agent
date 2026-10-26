@@ -9,7 +9,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from .config import Settings
-from .llm import LLM, Turn
+from .llm import LLM, ThinkError, Turn, Usage
 from .roles import Role
 from .schedule import local_day_start, next_occurrence, push_out_of_quiet, skip_reason
 from .storage import Checkin, Storage, User, utcnow
@@ -17,6 +17,11 @@ from .storage import Checkin, Storage, User, utcnow
 log = logging.getLogger(__name__)
 
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+BLOCKED = "Доступ к боту закрыт."
+TOO_FAST = "Слишком много сообщений подряд. Подожди минуту, и продолжим."
+DAY_LIMIT = "На сегодня лимит исчерпан, продолжим завтра."
+GLOBAL_LIMIT = "Бот на сегодня устал, продолжим завтра."
 
 CORE_RULES = """\
 
@@ -40,20 +45,29 @@ class Core:
         self.llm = llm
         self.role = role
         self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.alerts: list[str] = []  # messages for admins, sent by the front-end
+        self._global_alert_day: str | None = None
 
     # entry points ----------------------------------------------------------
 
-    async def start(self, user_id: int, name: str | None) -> str | None:
-        user, _ = self.storage.ensure_user(user_id, name, self.role.name)
+    async def start(self, user_id: int, name: str | None, username: str | None = None) -> str | None:
+        user = self._register(user_id, name, username)
+        if refusal := self.refusal(user, incoming=False):
+            return refusal
         self.storage.set_paused(user_id, False)
         self.ensure_routines(user)
         async with self._locks[user_id]:
             return await self._turn(user, why=self.role.onboarding, proactive=True)
 
-    async def on_message(self, user_id: int, name: str | None, text: str) -> str | None:
-        user, is_new = self.storage.ensure_user(user_id, name, self.role.name)
-        if is_new:
-            self.ensure_routines(user)
+    async def on_message(
+        self, user_id: int, name: str | None, text: str, username: str | None = None
+    ) -> str | None:
+        user = self._register(user_id, name, username)
+        limit = self.settings.max_message_chars
+        if len(text) > limit and not self.settings.is_admin(user_id):
+            return f"Слишком длинное сообщение: сократи его до {limit} символов."
+        if refusal := self.refusal(user, incoming=True):
+            return refusal
         async with self._locks[user_id]:
             self.storage.add_message(user_id, "user", text)
             # The person spoke: earlier follow-up plans may be outdated, the model re-plans.
@@ -73,6 +87,8 @@ class Core:
                 user.id, local_day_start(now, self.settings.timezone)
             )
             reason = skip_reason(checkin, user, now, sent_today, self.settings.daily_message_budget)
+            if not reason and self.refusal(user, incoming=False, now=now):
+                reason = "blocked or over the spending limit"
             if reason:
                 log.info("Skipping check-in %s (%s) for %s: %s", checkin.id, checkin.kind, user.id, reason)
                 self.storage.finish_checkin(checkin.id, "skipped")
@@ -80,8 +96,57 @@ class Core:
             else:
                 self.storage.finish_checkin(checkin.id, "sent")
                 text = await self._turn(user, why=self._why(checkin), proactive=True)
-            self.ensure_routines(user, now)
+            if not user.blocked:
+                self.ensure_routines(user, now)
             return text
+
+    def refusal(self, user: User, incoming: bool, now: datetime | None = None) -> str | None:
+        """Why this person can't get a model answer right now, as text for them; None if they can."""
+        if user.blocked:
+            return BLOCKED
+        s = self.settings
+        if s.is_admin(user.id):
+            return None
+        now = now or utcnow()
+        day = local_day_start(now, s.timezone)
+        if self.storage.spend_since(day) >= s.global_daily_budget_usd:
+            self._alert_global_limit(day)
+            return GLOBAL_LIMIT
+        if self.storage.spend_since(day, user.id) >= s.user_daily_budget_usd:
+            return DAY_LIMIT
+        if incoming:
+            if self.storage.user_messages_since(user.id, now - timedelta(minutes=1)) >= s.user_messages_per_minute:
+                return TOO_FAST
+            if self.storage.user_messages_since(user.id, day) >= s.user_messages_per_day:
+                return DAY_LIMIT
+        return None
+
+    def cost(self, usage: Usage) -> float:
+        s = self.settings
+        return (
+            usage.input_tokens * s.price_input
+            + usage.output_tokens * s.price_output
+            + usage.cache_read * s.price_cache_read
+            + usage.cache_write * s.price_cache_write
+        ) / 1_000_000
+
+    def _register(self, user_id: int, name: str | None, username: str | None) -> User:
+        user, is_new = self.storage.ensure_user(user_id, name, self.role.name, username)
+        if is_new:
+            self.ensure_routines(user)
+            if not self.settings.is_admin(user_id):
+                who = " ".join(p for p in (name, f"@{username}" if username else None) if p) or "без имени"
+                self.alerts.append(f"Новый пользователь: {who}, id {user_id}. Заблокировать: /block {user_id}")
+        return user
+
+    def _alert_global_limit(self, day: datetime) -> None:
+        key = day.date().isoformat()
+        if self._global_alert_day != key:
+            self._global_alert_day = key
+            self.alerts.append(
+                f"Общий дневной лимит ${self.settings.global_daily_budget_usd:.2f} исчерпан: "
+                "до завтра бот отвечает только админам. Кто тратит: /stats"
+            )
 
     def ensure_routines(self, user: User, now: datetime | None = None) -> None:
         now = now or utcnow()
@@ -103,13 +168,23 @@ class Core:
     async def _turn(self, user: User, why: str, proactive: bool) -> str | None:
         system = self.role.persona + CORE_RULES
         messages = self._messages(user, why)
-        turn = await self.llm.think(system, messages)
+        try:
+            turn, usage = await self.llm.think(system, messages)
+        except ThinkError as e:
+            self._record(user, e.usage)
+            raise
+        self._record(user, usage)
         self._apply(user, turn)
         text = turn.message.strip()
         if not text:
             return None
         self.storage.add_message(user.id, "bot", text, proactive=proactive)
         return text
+
+    def _record(self, user: User, usage: Usage) -> None:
+        self.storage.add_usage(
+            user.id, usage.input_tokens, usage.output_tokens, usage.cache_read, usage.cache_write, self.cost(usage)
+        )
 
     def _apply(self, user: User, turn: Turn) -> None:
         for fact in turn.new_facts:
