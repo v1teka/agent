@@ -54,6 +54,17 @@ CREATE TABLE IF NOT EXISTS checkins (
     status TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | skipped
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_time ON usage (created_at, user_id);
 CREATE INDEX IF NOT EXISTS idx_checkins_due ON checkins (status, due_at);
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages (user_id, id);
 """
@@ -71,6 +82,15 @@ def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+# Columns added after the first release; created on start if missing.
+MIGRATIONS = {
+    "users": {
+        "username": "TEXT",
+        "blocked": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
+
+
 @dataclass
 class User:
     id: int
@@ -80,6 +100,19 @@ class User:
     created_at: datetime
     last_user_message_at: datetime | None
     unanswered_proactive: int
+    username: str | None = None
+    blocked: bool = False
+
+
+@dataclass
+class UsageRow:
+    user_id: int
+    name: str | None
+    username: str | None
+    blocked: bool
+    turns: int
+    tokens: int
+    cost_usd: float
 
 
 @dataclass
@@ -123,7 +156,15 @@ class Storage:
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
         self.db.commit()
+
+    def _migrate(self) -> None:
+        for table, columns in MIGRATIONS.items():
+            existing = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for column, decl in columns.items():
+                if column not in existing:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     # users -----------------------------------------------------------------
 
@@ -139,16 +180,27 @@ class Storage:
             created_at=_dt(row["created_at"]),
             last_user_message_at=_dt(row["last_user_message_at"]),
             unanswered_proactive=row["unanswered_proactive"],
+            username=row["username"],
+            blocked=bool(row["blocked"]),
         )
 
-    def ensure_user(self, user_id: int, name: str | None, role: str) -> tuple[User, bool]:
+    def ensure_user(
+        self, user_id: int, name: str | None, role: str, username: str | None = None
+    ) -> tuple[User, bool]:
         """Return the user, creating them if needed. The flag is True for a new user."""
         existing = self.get_user(user_id)
         if existing:
+            if (name, username) != (existing.name, existing.username) and (name or username):
+                self.db.execute(
+                    "UPDATE users SET name = COALESCE(?, name), username = COALESCE(?, username) WHERE id = ?",
+                    (name, username, user_id),
+                )
+                self.db.commit()
+                return self.get_user(user_id), False
             return existing, False
         self.db.execute(
-            "INSERT INTO users (id, name, role, created_at) VALUES (?, ?, ?, ?)",
-            (user_id, name, role, _iso(utcnow())),
+            "INSERT INTO users (id, name, username, role, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, name, username, role, _iso(utcnow())),
         )
         self.db.commit()
         return self.get_user(user_id), True
@@ -160,6 +212,15 @@ class Storage:
     def set_paused(self, user_id: int, paused: bool) -> None:
         self.db.execute("UPDATE users SET paused = ? WHERE id = ?", (int(paused), user_id))
         self.db.commit()
+
+    def set_blocked(self, user_id: int, blocked: bool) -> bool:
+        cur = self.db.execute("UPDATE users SET blocked = ? WHERE id = ?", (int(blocked), user_id))
+        if blocked:
+            self.db.execute(
+                "UPDATE checkins SET status = 'skipped' WHERE user_id = ? AND status = 'pending'", (user_id,)
+            )
+        self.db.commit()
+        return cur.rowcount > 0
 
     # messages --------------------------------------------------------------
 
@@ -189,6 +250,13 @@ class Storage:
             Message(r["sender"], r["text"], bool(r["proactive"]), _dt(r["created_at"]))
             for r in reversed(rows)
         ]
+
+    def user_messages_since(self, user_id: int, since: datetime) -> int:
+        row = self.db.execute(
+            "SELECT COUNT(*) FROM messages WHERE user_id = ? AND sender = 'user' AND created_at >= ?",
+            (user_id, _iso(since)),
+        ).fetchone()
+        return row[0]
 
     def proactive_count_since(self, user_id: int, since: datetime) -> int:
         row = self.db.execute(
@@ -247,6 +315,46 @@ class Storage:
         ).fetchall()
         return [
             Task(r["id"], r["title"], r["details"], r["status"], r["note"], _dt(r["created_at"]))
+            for r in rows
+        ]
+
+    # usage -----------------------------------------------------------------
+
+    def add_usage(
+        self, user_id: int, input_tokens: int, output_tokens: int,
+        cache_read: int, cache_write: int, cost_usd: float,
+    ) -> None:
+        self.db.execute(
+            "INSERT INTO usage (user_id, created_at, input_tokens, output_tokens, cache_read_tokens,"
+            " cache_write_tokens, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, _iso(utcnow()), input_tokens, output_tokens, cache_read, cache_write, cost_usd),
+        )
+        self.db.commit()
+
+    def spend_since(self, since: datetime, user_id: int | None = None) -> float:
+        query = "SELECT COALESCE(SUM(cost_usd), 0) FROM usage WHERE created_at >= ?"
+        args: tuple = (_iso(since),)
+        if user_id is not None:
+            query += " AND user_id = ?"
+            args += (user_id,)
+        return self.db.execute(query, args).fetchone()[0]
+
+    def usage_report(self, since: datetime | None = None) -> list[UsageRow]:
+        """Spend per user, most expensive first. Users without spend are included."""
+        rows = self.db.execute(
+            """
+            SELECT u.id, u.name, u.username, u.blocked,
+                   COUNT(g.id) AS turns,
+                   COALESCE(SUM(g.input_tokens + g.output_tokens + g.cache_read_tokens + g.cache_write_tokens), 0) AS tokens,
+                   COALESCE(SUM(g.cost_usd), 0) AS cost
+            FROM users u
+            LEFT JOIN usage g ON g.user_id = u.id AND g.created_at >= ?
+            GROUP BY u.id ORDER BY cost DESC, u.created_at DESC
+            """,
+            (_iso(since) if since else "",),
+        ).fetchall()
+        return [
+            UsageRow(r["id"], r["name"], r["username"], bool(r["blocked"]), r["turns"], r["tokens"], r["cost"])
             for r in rows
         ]
 

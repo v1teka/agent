@@ -33,7 +33,9 @@ def _parse_ids(value: str) -> set[int]:
 @dataclass(frozen=True)
 class Settings:
     telegram_token: str
-    allowed_user_ids: set[int] = field(default_factory=set)
+    admin_user_ids: set[int] = field(default_factory=set)
+    public: bool = True
+    allowed_user_ids: set[int] = field(default_factory=set)  # extra users when the bot is private
     model: str = "claude-opus-5-5"
     effort: str = "low"
     db_path: Path = Path("data/agent.db")
@@ -46,6 +48,17 @@ class Settings:
     daily_message_budget: int = 4
     history_limit: int = 30
     tick_seconds: int = 60
+    # Abuse protection. Admins are exempt from all limits.
+    user_daily_budget_usd: float = 0.50
+    global_daily_budget_usd: float = 3.00
+    user_messages_per_minute: int = 5
+    user_messages_per_day: int = 60
+    max_message_chars: int = 2000
+    # USD per million tokens, used to estimate spend (defaults: claude-opus-5-5).
+    price_input: float = 4.00
+    price_output: float = 20.00
+    price_cache_read: float = 0.40
+    price_cache_write: float = 5.00
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
@@ -56,9 +69,14 @@ class Settings:
         if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
             raise SystemExit("ANTHROPIC_API_KEY is not set. Copy .env.example to .env and fill it in.")
         env = os.environ.get
+        allowed = _parse_ids(env("ALLOWED_USER_IDS", ""))
+        # Older configs only had ALLOWED_USER_IDS, which held the owner's id.
+        admins = _parse_ids(env("ADMIN_USER_IDS", "")) or allowed
         return cls(
             telegram_token=token,
-            allowed_user_ids=_parse_ids(env("ALLOWED_USER_IDS", "")),
+            admin_user_ids=admins,
+            public=env("ACCESS", "public").strip().lower() != "private",
+            allowed_user_ids=allowed,
             model=env("CLAUDE_MODEL", cls.model),
             effort=env("CLAUDE_EFFORT", cls.effort),
             db_path=Path(env("DB_PATH", str(cls.db_path))),
@@ -71,4 +89,19 @@ class Settings:
             daily_message_budget=int(env("DAILY_MESSAGE_BUDGET", "4")),
             history_limit=int(env("HISTORY_LIMIT", "30")),
             tick_seconds=int(env("TICK_SECONDS", "60")),
+            user_daily_budget_usd=float(env("USER_DAILY_BUDGET_USD", "0.50")),
+            global_daily_budget_usd=float(env("GLOBAL_DAILY_BUDGET_USD", "3.00")),
+            user_messages_per_minute=int(env("USER_MESSAGES_PER_MINUTE", "5")),
+            user_messages_per_day=int(env("USER_MESSAGES_PER_DAY", "60")),
+            max_message_chars=int(env("MAX_MESSAGE_CHARS", "2000")),
+            price_input=float(env("PRICE_INPUT_PER_MTOK", "4.00")),
+            price_output=float(env("PRICE_OUTPUT_PER_MTOK", "20.00")),
+            price_cache_read=float(env("PRICE_CACHE_READ_PER_MTOK", "0.40")),
+            price_cache_write=float(env("PRICE_CACHE_WRITE_PER_MTOK", "5.00")),
         )
+
+    def is_admin(self, user_id: int) -> bool:
+        return user_id in self.admin_user_ids
+
+    def may_use(self, user_id: int) -> bool:
+        return self.public or self.is_admin(user_id) or user_id in self.allowed_user_ids

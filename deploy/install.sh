@@ -49,13 +49,13 @@ if [ ! -f .env ]; then
   ask TELEGRAM_BOT_TOKEN "Токен бота от @BotFather" "" secret
   ask ANTHROPIC_API_KEY "API-ключ Claude (sk-ant-...)" "" secret
   ask TIMEZONE "Часовой пояс" "Europe/Moscow"
-  ask ALLOWED_USER_IDS "Твой Telegram id (можно оставить пустым и добавить позже)" "" optional
+  ask ADMIN_USER_IDS "Твой Telegram id, чтобы быть админом (можно оставить пустым: потом напиши боту /id)" "" optional
   cp .env.example .env
   sed -i \
     -e "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN|" \
     -e "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY|" \
     -e "s|^TIMEZONE=.*|TIMEZONE=$TIMEZONE|" \
-    -e "s|^ALLOWED_USER_IDS=.*|ALLOWED_USER_IDS=$ALLOWED_USER_IDS|" \
+    -e "s|^ADMIN_USER_IDS=.*|ADMIN_USER_IDS=$ADMIN_USER_IDS|" \
     .env
   chmod 600 .env
 fi
