@@ -223,3 +223,10 @@ def test_access_settings(monkeypatch, tmp_path):
     monkeypatch.setenv("ACCESS", "private")
     s = Settings.from_env(tmp_path / "none.env")
     assert s.may_use(7) and not s.may_use(99)
+
+
+async def test_reply_context_reaches_model(make_core):
+    core = make_core()
+    await core.on_message(1, None, "сделал!", reply_to="Задание: прогулка 10 минут")
+    _, messages = core.llm.calls[0]
+    assert "(В ответ на: «Задание: прогулка 10 минут»)\nсделал!" in messages[-1]["content"]

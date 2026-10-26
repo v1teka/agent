@@ -37,7 +37,7 @@ class Settings:
     public: bool = True
     allowed_user_ids: set[int] = field(default_factory=set)  # extra users when the bot is private
     model: str = "claude-opus-5-5"
-    effort: str = "low"
+    effort: str = "medium"
     db_path: Path = Path("data/agent.db")
     timezone: ZoneInfo = ZoneInfo("Europe/Moscow")
     role: str = "mentor"

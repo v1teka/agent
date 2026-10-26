@@ -31,6 +31,11 @@ Technical rules:
 - A <context> block comes from the app, not from the person: it holds your memory about them,
   their tasks, the current time and why you are being called now. Use it, don't quote it.
 - Speak the person's language (Russian unless they write otherwise). Plain text, no Markdown.
+- `message` is the finished text the person reads. Settle what to say before you write it and
+  never correct yourself inside it ("...нет, проще —"): if you change your mind, write only the
+  final version.
+- At most one task per message. "Today" and "tomorrow" are relative to Now in the context.
+- A message that starts with "(В ответ на ...)" is the person replying to that earlier message.
 - Save to new_facts anything durable you learn about the person that is not already in memory.
 - When you give a task, put it in new_task as well. When the person reports on a task, update it.
 - follow_ups are your own way to write first later, e.g. "check in 2 hours whether they started".
@@ -60,14 +65,19 @@ class Core:
             return await self._turn(user, why=self.role.onboarding, proactive=True)
 
     async def on_message(
-        self, user_id: int, name: str | None, text: str, username: str | None = None
+        self, user_id: int, name: str | None, text: str, username: str | None = None,
+        reply_to: str | None = None,
     ) -> str | None:
+        """`reply_to` is the text of the message the person replied to in Telegram, if any."""
         user = self._register(user_id, name, username)
         limit = self.settings.max_message_chars
         if len(text) > limit and not self.settings.is_admin(user_id):
             return f"Слишком длинное сообщение: сократи его до {limit} символов."
         if refusal := self.refusal(user, incoming=True):
             return refusal
+        if reply_to:
+            quoted = reply_to if len(reply_to) <= 300 else reply_to[:300] + "…"
+            text = f"(В ответ на: «{quoted}»)\n{text}"
         async with self._locks[user_id]:
             self.storage.add_message(user_id, "user", text)
             # The person spoke: earlier follow-up plans may be outdated, the model re-plans.
