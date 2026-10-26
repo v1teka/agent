@@ -43,7 +43,10 @@ class Turn(BaseModel):
     """Everything the model decides in one step."""
 
     message: str = Field(
-        description="Text to send to the person now. Empty string means: say nothing this time."
+        description=(
+            "The final text to send to the person now, with no self-corrections and at most one task. "
+            "Empty string means: say nothing this time."
+        )
     )
     new_facts: list[NewFact] = Field(description="Facts learned in this exchange that are not yet in memory.")
     new_task: NewTask | None = Field(description="A new task, only when you are actually assigning one.")

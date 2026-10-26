@@ -42,7 +42,7 @@ def make_mentor(morning: time, evening: time) -> Role:
                 at=morning,
                 instruction=(
                     "Morning check-in. Close yesterday's open task if it's still open "
-                    "(mark it skipped unless you know it was done), then give today's task."
+                    "(mark it skipped unless you know it was done), then give exactly one task for today."
                 ),
             ),
             Routine(

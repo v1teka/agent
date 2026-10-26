@@ -145,8 +145,11 @@ class TelegramBot:
             return
         chat_id = update.effective_chat.id
         await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        message = update.effective_message
+        quoted = message.reply_to_message
+        reply_to = (quoted.text or quoted.caption) if quoted else None
         reply = await self.core.on_message(
-            chat_id, self._name(update), update.effective_message.text, self._username(update)
+            chat_id, self._name(update), message.text, self._username(update), reply_to=reply_to
         )
         await self._send(chat_id, reply)
         await self._flush_alerts()
