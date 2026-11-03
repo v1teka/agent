@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-
-from telegram import Update
-from telegram.constants import ChatAction, ChatType
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-
-from .config import Settings
 from datetime import timedelta
 
-from .core import BLOCKED, Core
-from .schedule import local_day_start
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction, ChatType
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
+)
+
+from .config import Settings
+from .core import BLOCKED, BUTTONS, Core, Reply, can_press
+from .schedule import ACTIVE, COOLING, DORMANT, LAST_CALL, local_day_start
 from .storage import utcnow
 
 log = logging.getLogger(__name__)
@@ -21,9 +23,12 @@ log = logging.getLogger(__name__)
 TELEGRAM_LIMIT = 4000
 
 HELP = (
-    "Я пишу первым: утром даю задание на день, вечером спрашиваю, как прошло, "
-    "а иногда сам напоминаю о чём-то между делом.\n\n"
-    "Рассказывай о себе что угодно и когда угодно: каждая мелочь помогает подбирать задания точнее.\n\n"
+    "Я пишу первым: утром даю задание на день, вечером спрашиваю, как прошло, если задание ещё "
+    "не отмечено, а иногда сам напоминаю о чём-то между делом.\n\n"
+    "Под заданием есть кнопки «✅ Готово» и «🔄 Поменять»: отметить задание или попросить другое "
+    "можно в одно касание. Можно и просто написать.\n\n"
+    "Если долго не отвечаешь, я пишу реже, а потом замолкаю, пока не напишешь. Писать можно когда "
+    "угодно и о чём угодно: каждая мелочь о тебе помогает подбирать задания точнее.\n\n"
     "/me — что я о тебе помню\n"
     "/forget N — забыть факт номер N\n"
     "/tasks — последние задания\n"
@@ -35,6 +40,7 @@ HELP = (
 ADMIN_HELP = (
     "\n\nДля админа:\n"
     "/stats — кто сколько потратил\n"
+    "/engagement [дней] — кто как отвечает, по умолчанию за 7 дней\n"
     "/block ID — заблокировать пользователя\n"
     "/unblock ID — разблокировать"
 )
@@ -45,6 +51,26 @@ CATEGORY_RU = {
     "goals": "Цели и планы", "character": "Характер", "preferences": "Предпочтения", "other": "Другое",
 }
 STATUS_RU = {"open": "в работе", "done": "сделано", "skipped": "пропущено"}
+MODE_RU = {
+    ACTIVE: "обычный ритм",
+    COOLING: "пишу раз в день",
+    LAST_CALL: "скоро замолчу",
+    DORMANT: "молчу, жду ответа",
+    "paused": "на паузе",
+    "blocked": "заблокирован",
+}
+TASK_BUTTON = "task"  # callback data: "task:<action>:<task id>"
+
+
+def _who(name: str | None, username: str | None) -> str:
+    return " ".join(p for p in (name, f"@{username}" if username else None) if p) or "без имени"
+
+
+def _task_buttons(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(label, callback_data=f"{TASK_BUTTON}:{action}:{task_id}")
+        for action, label in BUTTONS.items()
+    ]])
 
 
 def _chunks(text: str) -> list[str]:
@@ -79,9 +105,11 @@ class TelegramBot:
         add(CommandHandler("resume", self._resume, filters=private))
         add(CommandHandler("id", self._id, filters=private))
         add(CommandHandler("stats", self._stats, filters=private))
+        add(CommandHandler("engagement", self._engagement, filters=private))
         add(CommandHandler("block", self._block, filters=private))
         add(CommandHandler("unblock", self._unblock, filters=private))
         add(MessageHandler(private & filters.TEXT & ~filters.COMMAND, self._text))
+        add(CallbackQueryHandler(self._button, pattern=rf"^{TASK_BUTTON}:"))
         self.app.add_error_handler(self._error)
 
     async def _allowed(self, update: Update) -> bool:
@@ -110,11 +138,14 @@ class TelegramBot:
                 except Exception:
                     log.exception("Could not alert admin %s", admin)
 
-    async def _send(self, chat_id: int, text: str | None) -> None:
-        if not text:
+    async def _send(self, chat_id: int, reply: Reply | None) -> None:
+        if not reply or not reply.text:
             return
-        for part in _chunks(text):
-            await self.app.bot.send_message(chat_id, part)
+        parts = _chunks(reply.text)
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            markup = _task_buttons(reply.task_id) if last and reply.task_id else None
+            await self.app.bot.send_message(chat_id, part, reply_markup=markup)
 
     @staticmethod
     def _name(update: Update) -> str | None:
@@ -154,6 +185,35 @@ class TelegramBot:
         await self._send(chat_id, reply)
         await self._flush_alerts()
 
+    async def _button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not await self._allowed(update):
+            await query.answer()
+            return
+        try:
+            _, action, raw_id = query.data.split(":")
+            task_id = int(raw_id)
+        except ValueError:
+            await query.answer()
+            return
+        chat_id = update.effective_chat.id
+        task = self.storage.get_task(chat_id, task_id)
+        try:
+            # The buttons have done their job either way.
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass  # already removed, e.g. by a double tap
+        if not can_press(action, task):
+            await query.answer("Это задание уже закрыто.")
+            return
+        await query.answer("Отметил ✅" if action == "done" else "Подберу другое")
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        reply = await self.core.on_button(
+            chat_id, self._name(update), action, task_id, self._username(update)
+        )
+        await self._send(chat_id, reply)
+        await self._flush_alerts()
+
     async def _me(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._allowed(update):
             return
@@ -176,7 +236,7 @@ class TelegramBot:
         if empty:
             lines.append("Пока пусто: " + ", ".join(empty).lower() + ". Можешь рассказать в любой момент.")
         lines.append("Забыть факт: /forget N")
-        await self._send(update.effective_chat.id, "\n".join(lines))
+        await self._send(update.effective_chat.id, Reply("\n".join(lines)))
 
     async def _forget(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._allowed(update):
@@ -198,7 +258,7 @@ class TelegramBot:
             f"#{t.id} {t.title} — {STATUS_RU.get(t.status, t.status)}" + (f" ({t.note})" if t.note else "")
             for t in tasks
         ]
-        await self._send(update.effective_chat.id, "\n".join(lines))
+        await self._send(update.effective_chat.id, Reply("\n".join(lines)))
 
     async def _pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._allowed(update):
@@ -207,11 +267,7 @@ class TelegramBot:
 
     async def _resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._allowed(update):
-            chat_id = update.effective_chat.id
-            self.storage.set_paused(chat_id, False)
-            user = self.storage.get_user(chat_id)
-            if user:
-                self.core.ensure_routines(user)
+            self.core.resume(update.effective_chat.id)
             await update.effective_message.reply_text("Снова на связи, буду писать первым.")
 
     async def _id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -233,7 +289,7 @@ class TelegramBot:
             "Сегодня · за 7 дней · всего:",
         ]
         for r in total[:30]:
-            who = " ".join(p for p in (r.name, f"@{r.username}" if r.username else None) if p) or "без имени"
+            who = _who(r.name, r.username)
             mark = " [заблокирован]" if r.blocked else ""
             mark += " [админ]" if self.settings.is_admin(r.user_id) else ""
             lines.append(
@@ -244,7 +300,33 @@ class TelegramBot:
             lines.append(f"…и ещё {len(total) - 30}")
         lines.append("")
         lines.append("Заблокировать: /block ID")
-        await self._send(update.effective_chat.id, "\n".join(lines))
+        await self._send(update.effective_chat.id, Reply("\n".join(lines)))
+
+    async def _engagement(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._admin(update):
+            return
+        days = int(context.args[0]) if context.args and context.args[0].isdigit() else 7
+        days = min(max(days, 1), 90)
+        rows = self.core.engagement_report(days)
+        lines = [
+            f"За {days} дн.: ответил на сообщения бота · написал сам · задания сделано/пропущено/открыто · режим",
+            "",
+        ]
+        for r in rows[:30]:
+            s = r.stats
+            share = f" ({round(100 * s.answered / s.proactive)}%)" if s.proactive else ""
+            lines.append(
+                f"{_who(r.user.name, r.user.username)}: {s.answered} из {s.proactive}{share} · {s.initiated}"
+                f" · {r.done}/{r.skipped}/{r.open} · {MODE_RU.get(r.mode, r.mode)}"
+            )
+        if len(rows) > 30:
+            lines.append(f"…и ещё {len(rows) - 30}")
+        lines.append("")
+        lines.append(
+            "«Ответил» — написал до следующего сообщения бота. «Сам» — не в ответ на сообщение бота "
+            "и после паузы от часа."
+        )
+        await self._send(update.effective_chat.id, Reply("\n".join(lines)))
 
     async def _set_blocked(self, update: Update, context: ContextTypes.DEFAULT_TYPE, blocked: bool) -> None:
         if not await self._admin(update):
@@ -274,8 +356,8 @@ class TelegramBot:
     async def _tick(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         for checkin in self.storage.due_checkins(utcnow()):
             try:
-                text = await self.core.fire(checkin)
-                await self._send(checkin.user_id, text)
+                reply = await self.core.fire(checkin)
+                await self._send(checkin.user_id, reply)
             except Exception:
                 log.exception("Check-in %s failed", checkin.id)
         await self._flush_alerts()

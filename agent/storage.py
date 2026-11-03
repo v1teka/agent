@@ -213,6 +213,11 @@ class Storage:
         self.db.execute("UPDATE users SET paused = ? WHERE id = ?", (int(paused), user_id))
         self.db.commit()
 
+    def reset_unanswered(self, user_id: int) -> None:
+        """The person asked for messages again (/start, /resume): back to the full rhythm."""
+        self.db.execute("UPDATE users SET unanswered_proactive = 0 WHERE id = ?", (user_id,))
+        self.db.commit()
+
     def set_blocked(self, user_id: int, blocked: bool) -> bool:
         cur = self.db.execute("UPDATE users SET blocked = ? WHERE id = ?", (int(blocked), user_id))
         if blocked:
@@ -250,6 +255,18 @@ class Storage:
             Message(r["sender"], r["text"], bool(r["proactive"]), _dt(r["created_at"]))
             for r in reversed(rows)
         ]
+
+    def messages_since(self, user_id: int, since: datetime) -> list[Message]:
+        rows = self.db.execute(
+            "SELECT * FROM messages WHERE user_id = ? AND created_at >= ? ORDER BY id", (user_id, _iso(since))
+        ).fetchall()
+        return [Message(r["sender"], r["text"], bool(r["proactive"]), _dt(r["created_at"])) for r in rows]
+
+    def last_proactive_at(self, user_id: int) -> datetime | None:
+        row = self.db.execute(
+            "SELECT MAX(created_at) FROM messages WHERE user_id = ? AND proactive = 1", (user_id,)
+        ).fetchone()
+        return _dt(row[0])
 
     def user_messages_since(self, user_id: int, since: datetime) -> int:
         row = self.db.execute(
@@ -313,10 +330,21 @@ class Storage:
         rows = self.db.execute(
             "SELECT * FROM tasks WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
         ).fetchall()
-        return [
-            Task(r["id"], r["title"], r["details"], r["status"], r["note"], _dt(r["created_at"]))
-            for r in rows
-        ]
+        return [self._task(r) for r in rows]
+
+    def tasks_since(self, user_id: int, since: datetime) -> list[Task]:
+        rows = self.db.execute(
+            "SELECT * FROM tasks WHERE user_id = ? AND created_at >= ? ORDER BY id DESC", (user_id, _iso(since))
+        ).fetchall()
+        return [self._task(r) for r in rows]
+
+    def get_task(self, user_id: int, task_id: int) -> Task | None:
+        row = self.db.execute("SELECT * FROM tasks WHERE user_id = ? AND id = ?", (user_id, task_id)).fetchone()
+        return self._task(row) if row else None
+
+    @staticmethod
+    def _task(r: sqlite3.Row) -> Task:
+        return Task(r["id"], r["title"], r["details"], r["status"], r["note"], _dt(r["created_at"]))
 
     # usage -----------------------------------------------------------------
 
