@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from functools import cache
+from zoneinfo import ZoneInfo, available_timezones
 
 from .roles.base import Routine
 from .storage import Checkin, User
@@ -20,6 +22,51 @@ DORMANT = "dormant"      # nothing until the person writes
 COOLING_AFTER = 2        # unanswered messages in a row
 LAST_CALL_AFTER = 4
 LAST_CALL_PAUSE_DAYS = 3  # days between the last cooling message and the last call
+
+
+@cache
+def _zone_names() -> dict[str, str]:
+    return {name.lower(): name for name in available_timezones()}
+
+
+def find_zone(name: str) -> ZoneInfo | None:
+    """An IANA time zone by its name, in any letter case."""
+    key = _zone_names().get(name.strip().lower())
+    return ZoneInfo(key) if key else None
+
+
+_OFFSET = re.compile(r"^(utc|gmt|мск|msk)?([+\-−])(\d{1,2})(?::?00)?$")
+
+
+def parse_timezone(text: str) -> ZoneInfo | None:
+    """A zone from what a person types: «Asia/Novosibirsk», «UTC+7», «+7» or «МСК+4»."""
+    text = text.strip()
+    if zone := find_zone(text):
+        return zone
+    compact = text.lower().replace(" ", "")
+    if compact in ("мск", "msk", "москва"):
+        return ZoneInfo("Europe/Moscow")
+    match = _OFFSET.match(compact)
+    if not match:
+        return None
+    base, sign, number = match.groups()
+    hours = (3 if base in ("мск", "msk") else 0) + (-1 if sign in "-−" else 1) * int(number)
+    if not -12 <= hours <= 14:
+        return None
+    # Etc/GMT zones count the other way round: Etc/GMT-7 is UTC+7.
+    return ZoneInfo("Etc/UTC" if hours == 0 else f"Etc/GMT{-hours:+d}")
+
+
+def utc_offset(tz: ZoneInfo, moment: datetime) -> str:
+    minutes = int(moment.astimezone(tz).utcoffset().total_seconds()) // 60
+    hours, rest = divmod(abs(minutes), 60)
+    return f"UTC{'-' if minutes < 0 else '+'}{hours}" + (f":{rest:02d}" if rest else "")
+
+
+def zone_label(tz: ZoneInfo, moment: datetime) -> str:
+    """«Asia/Novosibirsk, UTC+7», or just «UTC+7» for a zone made from an offset."""
+    offset = utc_offset(tz, moment)
+    return offset if tz.key.startswith("Etc/") else f"{tz.key}, {offset}"
 
 
 def cadence(unanswered: int) -> str:

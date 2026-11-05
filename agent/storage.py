@@ -87,6 +87,7 @@ MIGRATIONS = {
     "users": {
         "username": "TEXT",
         "blocked": "INTEGER NOT NULL DEFAULT 0",
+        "tz": "TEXT",  # IANA time zone of the person; NULL means the bot's default
     },
 }
 
@@ -102,6 +103,7 @@ class User:
     unanswered_proactive: int
     username: str | None = None
     blocked: bool = False
+    tz: str | None = None
 
 
 @dataclass
@@ -182,6 +184,7 @@ class Storage:
             unanswered_proactive=row["unanswered_proactive"],
             username=row["username"],
             blocked=bool(row["blocked"]),
+            tz=row["tz"],
         )
 
     def ensure_user(
@@ -211,6 +214,10 @@ class Storage:
 
     def set_paused(self, user_id: int, paused: bool) -> None:
         self.db.execute("UPDATE users SET paused = ? WHERE id = ?", (int(paused), user_id))
+        self.db.commit()
+
+    def set_timezone(self, user_id: int, tz: str | None) -> None:
+        self.db.execute("UPDATE users SET tz = ? WHERE id = ?", (tz, user_id))
         self.db.commit()
 
     def reset_unanswered(self, user_id: int) -> None:
@@ -396,6 +403,12 @@ class Storage:
         self.db.commit()
         return cur.lastrowid
 
+    def last_sent_at(self, user_id: int, kind: str) -> datetime | None:
+        row = self.db.execute(
+            "SELECT MAX(due_at) FROM checkins WHERE user_id = ? AND kind = ? AND status = 'sent'", (user_id, kind)
+        ).fetchone()
+        return _dt(row[0])
+
     def has_pending(self, user_id: int, kind: str) -> bool:
         row = self.db.execute(
             "SELECT 1 FROM checkins WHERE user_id = ? AND kind = ? AND status = 'pending'", (user_id, kind)
@@ -416,6 +429,18 @@ class Storage:
 
     def finish_checkin(self, checkin_id: int, status: str) -> None:
         self.db.execute("UPDATE checkins SET status = ? WHERE id = ?", (status, checkin_id))
+        self.db.commit()
+
+    def move_checkin(self, checkin_id: int, due_at: datetime) -> None:
+        self.db.execute("UPDATE checkins SET due_at = ? WHERE id = ?", (_iso(due_at), checkin_id))
+        self.db.commit()
+
+    def drop_pending_routines(self, user_id: int) -> None:
+        """Forget planned routine check-ins, e.g. to plan them again in another time zone."""
+        self.db.execute(
+            "UPDATE checkins SET status = 'skipped' WHERE user_id = ? AND kind != 'followup' AND status = 'pending'",
+            (user_id,),
+        )
         self.db.commit()
 
     def cancel_followups(self, user_id: int) -> None:

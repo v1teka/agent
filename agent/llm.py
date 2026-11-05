@@ -54,6 +54,12 @@ class Turn(BaseModel):
     follow_ups: list[FollowUp] = Field(
         description="Your own proactive check-ins to schedule, at most 2. Empty if the routine schedule is enough."
     )
+    timezone: str | None = Field(
+        description=(
+            "IANA time zone of the person, e.g. Asia/Novosibirsk, only when you learn that it differs from "
+            "the one in the context. Null otherwise."
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -72,7 +78,7 @@ class ThinkError(RuntimeError):
         self.usage = usage
 
 
-SILENT = Turn(message="", new_facts=[], new_task=None, task_updates=[], follow_ups=[])
+SILENT = Turn(message="", new_facts=[], new_task=None, task_updates=[], follow_ups=[], timezone=None)
 
 
 class LLM(Protocol):
