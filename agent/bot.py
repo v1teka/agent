@@ -15,7 +15,7 @@ from telegram.ext import (
 
 from .config import Settings
 from .core import BLOCKED, BUTTONS, Core, Reply, can_press
-from .schedule import ACTIVE, COOLING, DORMANT, LAST_CALL, local_day_start
+from .schedule import ACTIVE, COOLING, DORMANT, LAST_CALL, local_day_start, parse_timezone, zone_label
 from .storage import utcnow
 
 log = logging.getLogger(__name__)
@@ -34,6 +34,7 @@ HELP = (
     "/tasks — последние задания\n"
     "/pause — перестать писать первым\n"
     "/resume — снова писать первым\n"
+    "/tz — твой часовой пояс, например /tz МСК+4\n"
     "/id — твой Telegram id"
 )
 
@@ -104,6 +105,7 @@ class TelegramBot:
         add(CommandHandler("pause", self._pause, filters=private))
         add(CommandHandler("resume", self._resume, filters=private))
         add(CommandHandler("id", self._id, filters=private))
+        add(CommandHandler("tz", self._tz, filters=private))
         add(CommandHandler("stats", self._stats, filters=private))
         add(CommandHandler("engagement", self._engagement, filters=private))
         add(CommandHandler("block", self._block, filters=private))
@@ -269,6 +271,38 @@ class TelegramBot:
         if await self._allowed(update):
             self.core.resume(update.effective_chat.id)
             await update.effective_message.reply_text("Снова на связи, буду писать первым.")
+
+    async def _tz(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._allowed(update):
+            return
+        chat_id = update.effective_chat.id
+        reply = update.effective_message.reply_text
+        user = self.storage.get_user(chat_id)
+        if user is None:
+            await reply("Сначала напиши /start.")
+            return
+        now = utcnow()
+        s = self.settings
+        examples = (
+            "/tz МСК+4, /tz UTC+7 или /tz Asia/Novosibirsk. Можно и просто написать мне, в каком ты городе."
+        )
+        if not context.args:
+            tz = self.core.tz(user)
+            default = "" if user.tz else ", это пояс по умолчанию"
+            await reply(
+                f"Твой часовой пояс: {zone_label(tz, now)}{default}. У тебя сейчас {now.astimezone(tz):%H:%M}.\n"
+                f"Поменять: {examples}"
+            )
+            return
+        tz = parse_timezone(" ".join(context.args))
+        if tz is None:
+            await reply(f"Не понял часовой пояс. Напиши, например, {examples}")
+            return
+        self.core.set_timezone(chat_id, tz)
+        await reply(
+            f"Запомнил: {zone_label(tz, now)}, у тебя сейчас {now.astimezone(tz):%H:%M}. "
+            f"Утром пишу в {s.morning_at:%H:%M}, вечером в {s.evening_at:%H:%M} по твоему времени."
+        )
 
     async def _id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(f"Твой Telegram id: {update.effective_chat.id}")

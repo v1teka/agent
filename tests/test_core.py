@@ -21,6 +21,7 @@ def turn(message="ok", **kw) -> Turn:
         new_task=kw.get("new_task"),
         task_updates=kw.get("task_updates", []),
         follow_ups=kw.get("follow_ups", []),
+        timezone=kw.get("timezone"),
     )
 
 
@@ -216,7 +217,7 @@ def test_migration_adds_new_columns(tmp_path):
     con.execute("INSERT INTO users (id, name, role, created_at) VALUES (1, 'Виктор', 'mentor', '2026-10-17T00:00:00+00:00')")
     con.commit(); con.close()
     user = Storage(db).get_user(1)
-    assert user.name == "Виктор" and user.blocked is False and user.username is None
+    assert user.name == "Виктор" and user.blocked is False and user.username is None and user.tz is None
 
 
 def test_access_settings(monkeypatch, tmp_path):
@@ -505,3 +506,66 @@ async def test_engagement_report(make_core, clock):
     assert (rows[1].done, rows[1].skipped, rows[1].open) == (0, 0, 2)
     assert (rows[2].stats.answered, rows[2].mode) == (0, COOLING)
     assert [r.user.id for r in core.engagement_report(7)] == [1, 2]
+
+
+# the person's own time zone ---------------------------------------------------------------
+
+from agent.schedule import parse_timezone  # noqa: E402
+
+NSK = ZoneInfo("Asia/Novosibirsk")  # MSK+4
+
+
+def test_parse_timezone():
+    assert parse_timezone("asia/novosibirsk").key == "Asia/Novosibirsk"
+    assert parse_timezone("МСК+4").key == "Etc/GMT-7"  # that is UTC+7
+    assert parse_timezone("utc -5").key == "Etc/GMT+5"
+    assert parse_timezone("+7").key == "Etc/GMT-7"
+    assert parse_timezone("мск").key == "Europe/Moscow"
+    assert parse_timezone("Новосибирск") is None  # cities are for the model
+    assert parse_timezone("UTC+15") is None
+
+
+def local_times(core, user_id=1):
+    return sorted((c.kind, c.due_at.astimezone(core.tz(core.storage.get_user(user_id))).strftime("%a %H:%M"))
+                  for c in core.storage.pending_checkins(user_id))
+
+
+async def test_model_moves_the_person_to_their_time_zone(make_core, clock):
+    core = make_core(turn("Привет!"), turn("Понял, Новосибирск.", timezone="Asia/Novosibirsk"))
+    await core.start(1, None)  # Mon 10:00 MSK
+    assert local_times(core) == [("evening", "Mon 21:30"), ("morning", "Tue 09:00")]
+    await core.on_message(1, None, "я из Новосибирска")
+    assert core.storage.get_user(1).tz == "Asia/Novosibirsk"
+    # Same clock times, now on their clock: 21:30 in Novosibirsk is 17:30 in Moscow.
+    assert local_times(core) == [("evening", "Mon 21:30"), ("morning", "Tue 09:00")]
+    evening = next(c for c in core.storage.pending_checkins(1) if c.kind == "evening")
+    assert evening.due_at.astimezone(MSK).strftime("%H:%M") == "17:30"
+    clock.advance(minutes=5)
+    await core.on_message(1, None, "ок")
+    messages = core.llm.calls[-1][1]
+    assert "Now: Пн 02.11 14:05, their local time (Asia/Novosibirsk, UTC+7)" in messages[-1]["content"]
+    assert any("[Пн 02.11 14:00] я из Новосибирска" in m["content"] for m in messages)
+
+
+async def test_unknown_time_zone_from_the_model_is_ignored(make_core, clock):
+    core = make_core(turn("hi", timezone="Novosibirsk"))
+    await core.on_message(1, None, "hi")
+    assert core.storage.get_user(1).tz is None
+    assert "assumed by default" in core.llm.calls[0][1][-1]["content"]
+
+
+async def test_moving_west_right_after_the_morning_does_not_repeat_it(make_core, clock):
+    core = make_core(turn("hi"), turn("Доброе утро!"))
+    await core.start(1, None)
+    morning = next(c for c in core.storage.pending_checkins(1) if c.kind == "morning")
+    clock.now = morning.due_at  # Tue 09:00 MSK
+    await core.fire(morning, now=clock.now)
+    core.set_timezone(1, ZoneInfo("Europe/Kaliningrad"))  # 08:00 there: their 09:00 is an hour away
+    assert ("morning", "Wed 09:00") in local_times(core)
+
+
+async def test_planned_follow_up_leaves_their_night(make_core, clock):
+    core = make_core(turn("hi", follow_ups=[FollowUp(in_minutes=10 * 60, reason="как дела")]))
+    await core.on_message(1, None, "hi")  # Mon 10:00 MSK, follow-up at 20:00 MSK
+    core.set_timezone(1, NSK)  # 20:00 MSK is 00:00 in Novosibirsk: quiet hours there
+    assert ("followup", "Tue 08:00") in local_times(core)

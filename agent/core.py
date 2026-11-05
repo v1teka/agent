@@ -8,12 +8,14 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from .config import Settings
 from .llm import LLM, ThinkError, Turn, Usage
 from .roles import Role
 from .schedule import (
-    COOLING, LAST_CALL, cadence, local_day_start, next_occurrence, push_out_of_quiet, skip_reason,
+    COOLING, LAST_CALL, cadence, find_zone, local_day_start, next_occurrence, push_out_of_quiet,
+    skip_reason, zone_label,
 )
 from .signals import (
     INITIATIVE_PAUSE, ReplyStats, current, not_done, repeated_task, reply_stats, restated_task,
@@ -25,6 +27,9 @@ log = logging.getLogger(__name__)
 
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 STATS_WINDOW = timedelta(days=7)
+# A daily routine never comes again sooner than this, even when the person's time zone
+# changes right after it ran.
+ROUTINE_GAP = timedelta(hours=12)
 
 BLOCKED = "Доступ к боту закрыт."
 TOO_FAST = "Слишком много сообщений подряд. Подожди минуту, и продолжим."
@@ -45,8 +50,12 @@ def can_press(action: str, task: Task | None) -> bool:
 CORE_RULES = """\
 
 Technical rules:
-- Messages in the history are prefixed with their local time in square brackets. Never write
-  such a prefix yourself.
+- Messages in the history are prefixed with their time in square brackets. Never write such a
+  prefix yourself. All times, there and in the context, are the person's local time.
+- If memory or the conversation shows that the person lives in another time zone than the one
+  in the context, or they tell you their local time and it doesn't match, set `timezone` to the
+  IANA name of their zone (e.g. Asia/Novosibirsk): the app then writes to them by their clock.
+  Don't ask about it just for that.
 - A <context> block comes from the app, not from the person: it holds your memory about them,
   their tasks, how they respond, the current time and why you are being called now. Use it,
   don't quote it.
@@ -199,7 +208,7 @@ class Core:
             return None
         async with self._locks[checkin.user_id]:
             user = self.storage.get_user(checkin.user_id)
-            tz = self.settings.timezone
+            tz = self.tz(user)
             sent_today = self.storage.proactive_count_since(user.id, local_day_start(now, tz))
             latest = self.storage.recent_tasks(user.id, 1)
             reason = skip_reason(
@@ -296,10 +305,30 @@ class Core:
 
     def ensure_routines(self, user: User, now: datetime | None = None) -> None:
         now = now or utcnow()
+        tz = self.tz(self.storage.get_user(user.id) or user)
         for routine in self.role.routines:
             if not self.storage.has_pending(user.id, routine.kind):
-                due = next_occurrence(routine.at, now, self.settings.timezone)
+                after = now
+                if last := self.storage.last_sent_at(user.id, routine.kind):
+                    after = max(now, last + ROUTINE_GAP)
+                due = next_occurrence(routine.at, after, tz)
                 self.storage.add_checkin(user.id, due, routine.kind)
+
+    def tz(self, user: User) -> ZoneInfo:
+        """The person's time zone: the one they told the bot, or the bot's default."""
+        return (find_zone(user.tz) if user.tz else None) or self.settings.timezone
+
+    def set_timezone(self, user_id: int, tz: ZoneInfo) -> None:
+        """Remember the person's time zone and move planned check-ins to their clock."""
+        self.storage.set_timezone(user_id, tz.key)
+        user = self.storage.get_user(user_id)
+        self.storage.drop_pending_routines(user_id)
+        self.ensure_routines(user)
+        s = self.settings
+        for checkin in self.storage.pending_checkins(user_id):
+            moved = push_out_of_quiet(checkin.due_at, s.quiet_start, s.quiet_end, tz)
+            if moved != checkin.due_at:
+                self.storage.move_checkin(checkin.id, moved)
 
     # internals -------------------------------------------------------------
 
@@ -358,7 +387,7 @@ class Core:
         return REPEAT_NOTE.format(
             title=missed.title,
             times="once" if times == 1 else f"{times} times",
-            when=self._stamp(missed.created_at),
+            when=self._stamp(missed.created_at, self.tz(user)),
         )
 
     def _record(self, user: User, usage: Usage) -> None:
@@ -368,6 +397,14 @@ class Core:
 
     def _apply(self, user: User, turn: Turn) -> int | None:
         """Save what the model decided. Returns the id of the task the message gives, if any."""
+        if turn.timezone:
+            tz = find_zone(turn.timezone)
+            if tz is None:
+                log.warning("User %s: the model gave an unknown time zone %r", user.id, turn.timezone)
+            elif user.tz is None or tz.key != user.tz:  # also when it confirms the default
+                log.info("User %s: time zone %s", user.id, tz.key)
+                self.set_timezone(user.id, tz)
+                user = self.storage.get_user(user.id)
         for fact in turn.new_facts:
             self.storage.add_fact(user.id, fact.category, fact.text.strip())
         for update in turn.task_updates:
@@ -380,12 +417,13 @@ class Core:
         s = self.settings
         for follow_up in turn.follow_ups[:2]:
             minutes = min(max(follow_up.in_minutes, 15), 3 * 24 * 60)
-            due = push_out_of_quiet(utcnow() + timedelta(minutes=minutes), s.quiet_start, s.quiet_end, s.timezone)
+            due = push_out_of_quiet(utcnow() + timedelta(minutes=minutes), s.quiet_start, s.quiet_end, self.tz(user))
             self.storage.add_checkin(user.id, due, "followup", follow_up.reason)
         return task_id
 
-    def _stamp(self, moment: datetime) -> str:
-        local = moment.astimezone(self.settings.timezone)
+    @staticmethod
+    def _stamp(moment: datetime, tz: ZoneInfo) -> str:
+        local = moment.astimezone(tz)
         return f"{WEEKDAYS_RU[local.weekday()]} {local:%d.%m %H:%M}"
 
     def _engagement(self, user: User, now: datetime) -> str:
@@ -402,21 +440,23 @@ class Core:
 
     def _context(self, user: User, why: str) -> str:
         now = utcnow()
+        tz = self.tz(user)
         facts = self.storage.facts(user.id)
         tasks = self.storage.recent_tasks(user.id, 7)
         pending = self.storage.pending_checkins(user.id)
         signal = task_signal(tasks, now)
         lines = [
             "<context>",
-            f"Now: {self._stamp(now)} ({self.settings.timezone.key}).",
-            f"Person: {user.name or 'unknown name'}, with you since {self._stamp(user.created_at)}.",
+            f"Now: {self._stamp(now, tz)}, their local time ({zone_label(tz, now)}"
+            + (", assumed by default)." if user.tz is None else ")."),
+            f"Person: {user.name or 'unknown name'}, with you since {self._stamp(user.created_at, tz)}.",
             "",
             "Memory about the person:",
             *([f"- [{f.category}] {f.text}" for f in facts] or ["- nothing yet"]),
             "",
             "Recent tasks (newest first):",
             *(
-                [f"- #{t.id} [{t.status}] {t.title} ({self._stamp(t.created_at)})"
+                [f"- #{t.id} [{t.status}] {t.title} ({self._stamp(t.created_at, tz)})"
                  + (f" — {t.note}" if t.note else "") for t in tasks]
                 or ["- none yet"]
             ),
@@ -426,7 +466,7 @@ class Core:
             "",
             "Already scheduled check-ins:",
             *(
-                [f"- {self._stamp(c.due_at)} {c.kind}" + (f": {c.reason}" if c.reason else "") for c in pending]
+                [f"- {self._stamp(c.due_at, tz)} {c.kind}" + (f": {c.reason}" if c.reason else "") for c in pending]
                 or ["- none"]
             ),
             "",
@@ -437,10 +477,11 @@ class Core:
 
     def _messages(self, user: User, why: str) -> list[dict]:
         history = self.storage.recent_messages(user.id, self.settings.history_limit)
+        tz = self.tz(user)
         messages: list[dict] = []
         for m in history:
             role = "user" if m.sender == "user" else "assistant"
-            text = f"[{self._stamp(m.created_at)}] {m.text}"
+            text = f"[{self._stamp(m.created_at, tz)}] {m.text}"
             if messages and messages[-1]["role"] == role:
                 messages[-1]["content"] += "\n\n" + text
             else:
