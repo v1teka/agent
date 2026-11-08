@@ -83,6 +83,26 @@ bot.py                                    ← Telegram
 Обновить бота до свежей версии: выполнить ту же команду установки ещё раз, настройки и память сохранятся.
 Логи: `cd /opt/agent && docker compose logs -f`.
 
+### Автодеплой
+
+GitHub Actions (`.github/workflows/ci.yml`) гоняет тесты на каждый pull request и пуш в `main`.
+Если тесты прошли, после пуша в `main` он заходит на сервер по SSH и запускает `deploy/install.sh`,
+то есть обновляет бота так же, как ручной запуск команды установки. Сначала бота нужно один раз
+установить вручную (шаги выше). Деплой включается, когда в настройках репозитория
+(Settings → Secrets and variables → Actions) заданы секреты:
+
+- `VPS_HOST` — IP или домен сервера;
+- `VPS_SSH_KEY` — приватный SSH‑ключ без пароля, публичная часть которого лежит на сервере
+  в `~/.ssh/authorized_keys`. Создать: `ssh-keygen -t ed25519 -N "" -f deploy_key -C github-deploy`,
+  затем `ssh-copy-id -i deploy_key.pub root@IP-сервера`, а содержимое файла `deploy_key` вставить в секрет;
+- `VPS_KNOWN_HOSTS` (желательно) — ключ сервера, вывод `ssh-keyscan IP-сервера`. Без него
+  Actions доверяет тому ключу, который увидит при подключении;
+- `VPS_USER` и `VPS_PORT` (необязательно) — по умолчанию `root` и `22`. Если пользователь не root,
+  ему нужен `sudo` без пароля.
+
+Пока `VPS_HOST` и `VPS_SSH_KEY` не заданы, деплой пропускается, а тесты всё равно идут. Задеплоить
+вручную: Actions → CI/CD → Run workflow.
+
 ## Запуск у себя
 
 Скопируй `.env.example` в `.env`, впиши `TELEGRAM_BOT_TOKEN` и `ANTHROPIC_API_KEY` и запусти:

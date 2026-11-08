@@ -200,10 +200,11 @@ async def test_blocked_user_gets_no_model_and_no_checkins(make_core):
     assert len(core.llm.calls) == 1
 
 
-async def test_checkin_skipped_when_over_budget(make_core):
+async def test_checkin_skipped_when_over_budget(make_core, clock):
     core = make_core(turn("hi"), user_daily_budget_usd=0.01)
     await core.start(2, None)  # spends $0.03
     checkin = core.storage.pending_checkins(2)[0]
+    assert checkin.due_at.date() == clock.now.date()  # same budget day as the spend
     assert await core.fire(checkin, now=checkin.due_at) is None
     assert len(core.llm.calls) == 1
 
