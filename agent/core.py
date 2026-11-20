@@ -49,6 +49,22 @@ def can_press(action: str, task: Task | None) -> bool:
 
 CORE_RULES = """\
 
+How to talk:
+- What they wrote comes first, your plans second. When they ask a question or ask for advice,
+  about anything, not only what you usually work on, help for real: think it through and give
+  a specific, useful answer, the way a friend who knows the subject would, as long as a good
+  answer needs. Never brush it off with a bare "не знаю", and never answer with a task, a
+  question about tasks or a change of topic instead. If something is unclear, give your best
+  answer first, then ask. Don't add a task to such an answer unless they ask for one.
+- Greet once per conversation. If your last message already greeted them ("Доброе утро!") or
+  you're in the middle of talking, their "привет" is an answer, not a new start: don't greet
+  again, just carry on.
+- Say goodbye once and let the conversation end. If they say good night or bye first, answer
+  once, briefly. If you've already said yours and they say it back, or once things are wrapped
+  up they only thank you, agree or send an emoji, the conversation is over: leave `message`
+  empty and set `reaction`, so they see you read it. After good nights, don't write first
+  again until the morning.
+
 Technical rules:
 - Messages in the history are prefixed with their time in square brackets. Never write such a
   prefix yourself. All times, there and in the context, are the person's local time.
@@ -74,16 +90,20 @@ Technical rules:
   Use them sparingly; the routine check-ins already exist.
 """
 
-REPLY_WHY = "The person just wrote to you. Answer them."
+REPLY_WHY = (
+    "The person just wrote to you. Answer what they wrote: a question or a request of theirs comes "
+    "before your plans. If their message only closes a conversation that is already over, leave "
+    "the message empty and set a reaction."
+)
 INITIATED_WHY = (
     "The person wrote to you on their own, not in reply to a check-in. That's what you want more "
-    "of: answer what they brought with full attention and don't turn it into a check-in. Don't "
-    "comment on the fact that they wrote first."
+    "of: answer what they brought with full attention and real help, and don't steer it to tasks "
+    "or turn it into a check-in. Don't comment on the fact that they wrote first."
 )
 DONE_WHY = (
-    "The person pressed «✅ Готово» under task #{id} «{title}»: it's done. React in one short, warm "
-    "sentence that is specific to this task. No new task now. Ask one light question only if the "
-    "answer would really help you."
+    "The person pressed «✅ Готово» under task #{id} «{title}»: it's done. Answer with one short, "
+    "warm sentence that is specific to this task. No new task now. Ask one light question only if "
+    "the answer would really help you."
 )
 SWAP_WHY = (
     "The person pressed «🔄 Поменять» under task #{id} «{title}»: it doesn't suit them today. "
@@ -111,10 +131,12 @@ REPEAT_NOTE = (
 @dataclass(frozen=True)
 class Reply:
     """What to send to the person. `task_id` is set when the message gives a task, so the
-    front-end can show buttons to report it."""
+    front-end can show buttons to report it. `reaction` is an emoji to put on the message the
+    person just sent; with an empty `text` it is the whole answer."""
 
     text: str
     task_id: int | None = None
+    reaction: str | None = None
 
 
 @dataclass(frozen=True)
@@ -173,7 +195,7 @@ class Core:
             self.storage.add_message(user_id, "user", text)
             # The person spoke: earlier follow-up plans may be outdated, the model re-plans.
             self.storage.cancel_followups(user_id)
-            return await self._turn(self.storage.get_user(user_id), why=why, proactive=False)
+            return await self._turn(self.storage.get_user(user_id), why=why, proactive=False, can_react=True)
 
     async def on_button(
         self, user_id: int, name: str | None, action: str, task_id: int, username: str | None = None,
@@ -354,7 +376,8 @@ class Core:
             return why + " " + COOLING_NOTE.format(n=user.unanswered_proactive)
         return why
 
-    async def _turn(self, user: User, why: str, proactive: bool) -> Reply | None:
+    async def _turn(self, user: User, why: str, proactive: bool, can_react: bool = False) -> Reply | None:
+        """`can_react`: the turn answers a message the person sent, so a reaction can go on it."""
         system = self.role.persona + CORE_RULES
         turn = await self._think(user, system, self._messages(user, why))
         if turn.new_task and (correction := self._repeat_correction(user, turn.new_task.title)):
@@ -362,10 +385,12 @@ class Core:
             turn = await self._think(user, system, self._messages(user, why + correction))
         task_id = self._apply(user, turn)
         text = turn.message.strip()
+        reaction = turn.reaction if can_react else None
         if not text:
-            return None
+            # Nothing to say. A reaction alone closes a conversation without another message.
+            return Reply("", reaction=reaction) if reaction else None
         self.storage.add_message(user.id, "bot", text, proactive=proactive)
-        return Reply(text, task_id)
+        return Reply(text, task_id, reaction)
 
     async def _think(self, user: User, system: str, messages: list[dict]) -> Turn:
         try:
@@ -460,7 +485,9 @@ class Core:
                  + (f" — {t.note}" if t.note else "") for t in tasks]
                 or ["- none yet"]
             ),
-            *([f"Task signal: {signal}"] if signal else []),
+            # Only for when the model gives a task: on its own, the signal pulled answers to
+            # the person's questions toward a new task.
+            *([f"Task signal (for when you give a task, not a reason to give one): {signal}"] if signal else []),
             "",
             f"How they respond: {self._engagement(user, now)}",
             "",

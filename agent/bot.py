@@ -8,7 +8,7 @@ from datetime import timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ChatType
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
@@ -184,6 +184,11 @@ class TelegramBot:
         reply = await self.core.on_message(
             chat_id, self._name(update), message.text, self._username(update), reply_to=reply_to
         )
+        if reply and reply.reaction:
+            try:
+                await message.set_reaction(reply.reaction)
+            except TelegramError:
+                log.warning("Could not react to a message from %s", chat_id, exc_info=True)
         await self._send(chat_id, reply)
         await self._flush_alerts()
 
