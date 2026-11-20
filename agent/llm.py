@@ -17,6 +17,10 @@ FactCategory = Literal[
     "interests", "relationships", "goals", "character", "preferences", "other",
 ]
 
+# Emoji the bot can put on the person's message. Telegram accepts only its own set of
+# reactions, and these are all in it.
+Reaction = Literal["❤", "👍", "🔥", "🤗", "😁"]
+
 
 class NewFact(BaseModel):
     category: FactCategory
@@ -46,6 +50,13 @@ class Turn(BaseModel):
         description=(
             "The final text to send to the person now, with no self-corrections and at most one task. "
             "Empty string means: say nothing this time."
+        )
+    )
+    reaction: Reaction | None = Field(
+        description=(
+            "An emoji reaction to the person's last message, mostly for when it needs no answer and "
+            "`message` is empty, e.g. their good night after yours. Null otherwise. Works only when "
+            "you are answering a message they sent."
         )
     )
     new_facts: list[NewFact] = Field(description="Facts learned in this exchange that are not yet in memory.")
@@ -78,7 +89,9 @@ class ThinkError(RuntimeError):
         self.usage = usage
 
 
-SILENT = Turn(message="", new_facts=[], new_task=None, task_updates=[], follow_ups=[], timezone=None)
+SILENT = Turn(
+    message="", reaction=None, new_facts=[], new_task=None, task_updates=[], follow_ups=[], timezone=None
+)
 
 
 class LLM(Protocol):

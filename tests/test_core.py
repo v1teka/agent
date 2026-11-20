@@ -17,6 +17,7 @@ MSK = ZoneInfo("Europe/Moscow")
 def turn(message="ok", **kw) -> Turn:
     return Turn(
         message=message,
+        reaction=kw.get("reaction"),
         new_facts=kw.get("new_facts", []),
         new_task=kw.get("new_task"),
         task_updates=kw.get("task_updates", []),
@@ -354,7 +355,10 @@ async def test_repeating_a_skipped_task_is_sent_back_to_the_model(make_core, clo
     reply = await core.fire(morning, now=morning.due_at)
     assert reply.text == "Выложи из пенала одну сломанную ручку."
     assert len(core.llm.calls) == 3  # greeting, draft, rewrite
-    assert "Task signal: The last 2 tasks were not done" in core.llm.calls[1][1][-1]["content"]
+    assert (
+        "Task signal (for when you give a task, not a reason to give one): The last 2 tasks were not done"
+        in core.llm.calls[1][1][-1]["content"]
+    )
     assert "Correction from the app" in core.llm.why(2) and "2 times" in core.llm.why(2)
     titles = [t.title for t in core.storage.recent_tasks(1)]
     assert titles == ["Выкинуть сломанную ручку", "Разобрать пенал", "Разобрать пенал"]
@@ -570,3 +574,76 @@ async def test_planned_follow_up_leaves_their_night(make_core, clock):
     await core.on_message(1, None, "hi")  # Mon 10:00 MSK, follow-up at 20:00 MSK
     core.set_timezone(1, NSK)  # 20:00 MSK is 00:00 in Novosibirsk: quiet hours there
     assert ("followup", "Tue 08:00") in local_times(core)
+
+
+# how a conversation goes ------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+from typing import get_args  # noqa: E402
+
+from telegram.constants import ReactionEmoji  # noqa: E402
+from telegram.error import BadRequest  # noqa: E402
+
+from agent.bot import TelegramBot  # noqa: E402
+from agent.core import Reply  # noqa: E402
+from agent.llm import Reaction  # noqa: E402
+
+
+async def test_their_good_night_after_ours_gets_a_reaction_not_another_message(make_core, clock):
+    core = make_core(
+        turn("Привет! Задание: стакан воды."),
+        turn("Спокойной ночи!"),
+        turn("", reaction="❤"),  # their good night back: the conversation is over
+    )
+    await core.start(1, None)
+    await core.on_message(1, None, "Всё, я спать. Спокойной ночи!")
+    clock.advance(minutes=1)
+    assert await core.on_message(1, None, "Спокойной ночи") == Reply("", reaction="❤")
+    bot_texts = [m.text for m in core.storage.recent_messages(1, 10) if m.sender == "bot"]
+    assert bot_texts == ["Привет! Задание: стакан воды.", "Спокойной ночи!"]
+    assert core.storage.get_user(1).unanswered_proactive == 0
+
+
+async def test_reaction_goes_only_on_a_message_the_person_sent(make_core, clock):
+    core = make_core(turn("Задание", new_task=NewTask(title="Прогулка", details="")))
+    first = await core.start(1, None)
+    core.llm.turns += [turn("", reaction="👍"), turn("Красавчик!", reaction="🔥"), turn("", reaction="👍")]
+    assert await core.on_button(1, None, "done", first.task_id) is None  # a tap, not a message
+    assert await core.on_message(1, None, "Прошёл 5 км!") == Reply("Красавчик!", reaction="🔥")
+    morning = next(c for c in core.storage.pending_checkins(1) if c.kind == "morning")
+    assert await core.fire(morning, now=morning.due_at) is None  # a check-in: silence is silence
+
+
+def test_reactions_are_ones_telegram_accepts():
+    assert set(get_args(Reaction)) <= {e.value for e in ReactionEmoji}
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_telegram_puts_the_reaction_on_their_message(make_core, fails):
+    core = make_core(turn("", reaction="❤"), admin_user_ids={1})
+    bot = TelegramBot(core.settings, core)
+
+    class Message:
+        text = "Спокойной ночи"
+        reply_to_message = None
+
+        def __init__(self):
+            self.reactions = []
+
+        async def set_reaction(self, emoji):
+            if fails:
+                raise BadRequest("Reaction_invalid")
+            self.reactions.append(emoji)
+
+    async def nothing(*args, **kwargs):
+        pass
+
+    message = Message()
+    update = SimpleNamespace(
+        effective_chat=SimpleNamespace(id=1, type="private", username=None),
+        effective_message=message,
+        effective_user=SimpleNamespace(first_name="Виктор", username=None),
+    )
+    # No text to send: a network call to Telegram would fail the test.
+    await bot._text(update, SimpleNamespace(bot=SimpleNamespace(send_chat_action=nothing)))
+    assert message.reactions == ([] if fails else ["❤"])
